@@ -1,106 +1,148 @@
-<!doctype html><meta charset="utf-8">
-<title>View Camera</title>
-<body>
-  <h3>Viewing camera</h3>
-  <!-- muted helps autoplay across browsers -->
-  <video id="remote" autoplay playsinline muted controls
-         style="width:640px;max-width:100%;display:block;background:#000"></video>
-  <button id="playBtn" style="margin:8px 0;display:none">▶️ Play</button>
-  <pre id="log" style="max-width:640px;white-space:pre-wrap"></pre>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>View Camera</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-slate-100">
+  <div class="max-w-3xl mx-auto p-6">
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Viewing camera</h1>
+      <p class="text-slate-300 mt-1">If playback doesn’t start automatically, press “Play”.</p>
+    </header>
+
+    <div class="bg-slate-800/70 backdrop-blur rounded-2xl shadow-xl p-4 md:p-6 border border-slate-700">
+      <div class="flex items-center gap-2 mb-4">
+        <div id="statusDot" class="h-2.5 w-2.5 rounded-full bg-amber-400 animate-pulse"></div>
+        <span id="statusText" class="text-sm text-slate-300">Waiting for stream…</span>
+      </div>
+
+      <div class="relative rounded-xl overflow-hidden border border-slate-700 shadow-inner">
+        <video id="remote" autoplay playsinline muted controls
+               class="w-full bg-black aspect-video object-contain"></video>
+
+        <!-- Play overlay (shows only if autoplay is blocked) -->
+        <button id="playBtn"
+                class="hidden absolute inset-0 m-auto h-14 w-36 rounded-xl bg-emerald-500 text-white font-medium shadow-lg hover:bg-emerald-600 transition focus:outline-none focus:ring-2 focus:ring-emerald-400">
+          ▶ Play
+        </button>
+
+        <div id="errorBox" class="hidden absolute inset-x-4 bottom-4 md:bottom-6 rounded-lg border border-red-500/40 bg-red-500/10 p-3 md:p-4">
+          <p class="text-sm text-red-200" id="errorText"></p>
+        </div>
+      </div>
+
+      <div class="mt-4 text-xs text-slate-400">
+        Keep this tab open to continue viewing.
+      </div>
+    </div>
+  </div>
 
   <script>
-    const remote = document.getElementById('remote');
-    const playBtn = document.getElementById('playBtn');
-    const logEl = document.getElementById('log');
-    const log = (...a)=>{ console.log(...a); logEl.textContent += a.join(' ') + "\n"; };
+    const remote    = document.getElementById('remote');
+    const playBtn   = document.getElementById('playBtn');
+    const statusDot = document.getElementById('statusDot');
+    const statusTxt = document.getElementById('statusText');
+    const errorBox  = document.getElementById('errorBox');
+    const errorText = document.getElementById('errorText');
+
+    function setStatus(colorClass, text, pulse=false){
+      statusDot.className = `h-2.5 w-2.5 rounded-full ${colorClass}` + (pulse ? " animate-pulse" : "");
+      statusTxt.textContent = text;
+    }
+    function showError(msg){
+      errorText.textContent = msg;
+      errorBox.classList.remove('hidden');
+    }
 
     const sid = new URLSearchParams(location.search).get('sid');
-    if (!sid) { document.body.append("Missing sid"); throw new Error("sid required"); }
+    if (!sid) showError('Missing session id (?sid=...)');
+
+    function ensurePlay(){
+      remote.play().then(()=>{
+        playBtn.classList.add('hidden');
+      }).catch(()=>{
+        playBtn.classList.remove('hidden');
+      });
+    }
+    playBtn.addEventListener('click', ensurePlay);
+    remote.addEventListener('loadedmetadata', ensurePlay);
+    remote.addEventListener('canplay', ()=>{ setStatus('bg-emerald-400','Playing'); ensurePlay(); });
+    remote.addEventListener('playing', ()=> setStatus('bg-emerald-400','Playing'));
 
     const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
-    function wsSend(o){const d=JSON.stringify(o);
-      if(ws.readyState===WebSocket.OPEN) ws.send(d);
-      else if(ws.readyState===WebSocket.CONNECTING) ws.addEventListener('open',()=>ws.send(d),{once:true});
-      else log('WS not open; drop',o.type);
+    function wsSend(obj){
+      const data = JSON.stringify(obj);
+      if (ws.readyState === WebSocket.OPEN) ws.send(data);
+      else if (ws.readyState === WebSocket.CONNECTING) ws.addEventListener('open', () => ws.send(data), { once:true });
     }
-    ws.addEventListener('open',()=>{ log('WS open, sending hello (viewer)'); ws.send(JSON.stringify({role:'viewer', sid})); });
+    ws.addEventListener('open', ()=> ws.send(JSON.stringify({ role:'viewer', sid })));
 
-    const pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pc.addTransceiver('video', { direction: 'recvonly' });
 
-    // Ensure a receiving transceiver (helps some browsers)
-    const rx = pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') setStatus('bg-emerald-400','Connected');
+      else if (pc.connectionState === 'connecting') setStatus('bg-amber-400','Connecting…', true);
+      else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') setStatus('bg-rose-500','Disconnected');
+    };
 
-    // Prefer H264 if available
-    (function preferH264(){
-      try {
-        const caps = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
-        if (!caps || !caps.codecs) return;
-        const h264 = caps.codecs.filter(c=>/H264/i.test(c.mimeType));
-        const others = caps.codecs.filter(c=>!/H264/i.test(c.mimeType));
-        const prefs = h264.concat(others);
-        if (rx && rx.setCodecPreferences) rx.setCodecPreferences(prefs);
-        log('Codec pref set (viewer): H264 preferred');
-      } catch(e){ log('Codec pref error (viewer):', e); }
-    })();
+    // Prepare empty stream; we add the track once it starts
+    const remoteStream = new MediaStream();
+    remote.srcObject = remoteStream;
 
-    pc.onicegatheringstatechange = ()=>log('iceGatheringState:', pc.iceGatheringState);
-    pc.onconnectionstatechange   = ()=>log('connectionState:', pc.connectionState);
-    pc.onsignalingstatechange    = ()=>log('signalingState:', pc.signalingState);
-
-    // Playback helpers
-    function ensurePlay() {
-      remote.play().then(()=>{ log('remote.play() OK'); playBtn.style.display='none'; })
-                   .catch(err=>{ log('remote.play() blocked:', err); playBtn.style.display='inline-block'; });
-    }
-    remote.addEventListener('loadedmetadata', ()=>{ log('loadedmetadata size=', remote.videoWidth+'x'+remote.videoHeight); ensurePlay(); });
-    remote.addEventListener('canplay', ensurePlay);
-    remote.addEventListener('resize', ()=>{ log('resize size=', remote.videoWidth+'x'+remote.videoHeight); });
-    playBtn.addEventListener('click', ensurePlay);
-
-    // Attach incoming video robustly
     pc.ontrack = e => {
-      log('ontrack fired, streams=', e.streams.length);
+      const track = e.track;
+      if (track.kind !== 'video') return;
+
+      // Attach when frames start flowing
+      track.onunmute = () => {
+        if (!remoteStream.getVideoTracks().length) remoteStream.addTrack(track);
+        setStatus('bg-emerald-400','Playing');
+        ensurePlay();
+      };
+
+      // Also add any provided stream proactively
       if (e.streams && e.streams[0]) {
-        remote.srcObject = e.streams[0];
-        log('attached e.streams[0]');
-      } else {
-        const ms = new MediaStream([e.track]);
-        remote.srcObject = ms;
-        log('attached MediaStream(track)');
-      }
-      ensurePlay();
-      // If supported, log frame arrivals
-      if ('requestVideoFrameCallback' in remote) {
-        const raf = remote.requestVideoFrameCallback.bind(remote);
-        const loop = ()=>raf((now,meta)=>{ log('frame', meta.width+'x'+meta.height, 'rt='+meta.mediaTime.toFixed(2)); loop(); });
-        loop();
+        const vt = e.streams[0].getVideoTracks()[0];
+        if (vt && !remoteStream.getVideoTracks().length) remoteStream.addTrack(vt);
       }
     };
 
-    // ICE buffering until remote offer set
-    const pendingRemoteICE = [];
-    const remoteSet = ()=> pc.remoteDescription && pc.remoteDescription.type;
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === 'complete' && pc.connectionState !== 'connected') {
+        setStatus('bg-amber-400','Waiting for sender…', true);
+      }
+    };
+
+    pc.onicecandidate = e => { if (e.candidate) wsSend({ type:'ice', candidate:e.candidate }); };
+
+    // Buffer ICE until remote offer is set
+    const pendingICE = [];
+    const remoteSet = () => pc.remoteDescription && pc.remoteDescription.type;
     async function drainICE(){
-      while (pendingRemoteICE.length) {
-        const c = pendingRemoteICE.shift();
-        try { await pc.addIceCandidate(c); } catch(e){ log('addIceCandidate (viewer) error:', e); }
+      while (pendingICE.length) {
+        const c = pendingICE.shift();
+        try { await pc.addIceCandidate(c); } catch {}
       }
     }
 
-    ws.onmessage = async ev=>{
+    ws.onmessage = async ev => {
       const m = JSON.parse(ev.data);
-      if (m.type==='offer') {
-        log('Received offer');
-        await pc.setRemoteDescription({type:'offer', sdp:m.sdp});
+      if (m.type === 'offer') {
+        setStatus('bg-amber-400','Negotiating…', true);
+        await pc.setRemoteDescription({ type:'offer', sdp: m.sdp });
         await drainICE();
         const ans = await pc.createAnswer();
         await pc.setLocalDescription(ans);
-        log('Sending answer');
-        wsSend({type:'answer', sdp: pc.localDescription.sdp});
-      } else if (m.type==='ice') {
-        if (!remoteSet()) pendingRemoteICE.push(m.candidate);
-        else { try { await pc.addIceCandidate(m.candidate); } catch(e){ log('addIceCandidate (viewer) error:', e); } }
+        wsSend({ type:'answer', sdp: pc.localDescription.sdp });
+      } else if (m.type === 'ice') {
+        if (!remoteSet()) pendingICE.push(m.candidate);
+        else { try { await pc.addIceCandidate(m.candidate); } catch {} }
       }
     };
   </script>
 </body>
+</html>
