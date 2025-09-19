@@ -1,0 +1,79 @@
+<!doctype html><meta charset="utf-8">
+<title>Share Camera</title>
+<body>
+  <h3>Share your camera</h3>
+  <video id="local" autoplay playsinline muted
+         style="width:640px;max-width:100%;display:block;background:#000"></video>
+  <pre id="log" style="max-width:640px;white-space:pre-wrap"></pre>
+  <script>
+    const logEl = document.getElementById('log');
+    const log = (...a) => { console.log(...a); logEl.textContent += a.join(' ') + "\n"; };
+
+    const sid = new URLSearchParams(location.search).get('sid');
+    if (!sid) { document.body.append("Missing sid"); throw new Error("sid required"); }
+
+    const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+    function wsSend(o){const d=JSON.stringify(o);
+      if(ws.readyState===WebSocket.OPEN) ws.send(d);
+      else if(ws.readyState===WebSocket.CONNECTING) ws.addEventListener('open',()=>ws.send(d),{once:true});
+      else log('WS not open; drop',o.type);
+    }
+    ws.addEventListener('open', ()=>{ log('WS open, sending hello (sender)'); ws.send(JSON.stringify({role:'sender', sid})); });
+
+    const pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+    pc.onicegatheringstatechange = ()=>log('iceGatheringState:', pc.iceGatheringState);
+    pc.onconnectionstatechange   = ()=>log('connectionState:', pc.connectionState);
+    pc.onsignalingstatechange    = ()=>log('signalingState:', pc.signalingState);
+    pc.onicecandidate = e=>{ if(e.candidate) wsSend({type:'ice', candidate:e.candidate}); else log('ICE: end-of-candidates (sender)'); };
+
+    // Prefer H264 when available (helps Safari/Edge)
+    function preferH264() {
+      try {
+        const caps = RTCRtpSender.getCapabilities && RTCRtpSender.getCapabilities('video');
+        if (!caps || !caps.codecs) return;
+        const h264 = caps.codecs.filter(c=>/H264/i.test(c.mimeType));
+        const others = caps.codecs.filter(c=>!/H264/i.test(c.mimeType));
+        const prefs = h264.concat(others);
+        pc.getTransceivers().forEach(t=>{
+          if (t.sender && t.setCodecPreferences) t.setCodecPreferences(prefs);
+        });
+        log('Codec pref set: H264 preferred');
+      } catch(e){ log('Codec pref error:', e); }
+    }
+
+    (async ()=>{
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({video:true, audio:false});
+        local.srcObject = stream;
+        for (const t of stream.getTracks()) pc.addTrack(t, stream);
+        preferH264();
+        const offer = await pc.createOffer({offerToReceiveVideo:false});
+        await pc.setLocalDescription(offer);
+        log('Sending offer');
+        wsSend({type:'offer', sdp: pc.localDescription.sdp});
+      } catch(e){ log('Error starting camera/offer:', e); }
+    })();
+
+    // ICE from viewer may arrive before answer; buffer till remoteDescription set
+    const pendingRemoteICE = [];
+    const remoteSet = ()=> pc.remoteDescription && pc.remoteDescription.type;
+    async function drainICE(){
+      while (pendingRemoteICE.length) {
+        const c = pendingRemoteICE.shift();
+        try { await pc.addIceCandidate(c); } catch(e){ log('addIceCandidate (sender) error:', e); }
+      }
+    }
+
+    ws.onmessage = async ev=>{
+      const m = JSON.parse(ev.data);
+      if (m.type==='answer') {
+        log('Received answer');
+        await pc.setRemoteDescription({type:'answer', sdp:m.sdp});
+        await drainICE();
+      } else if (m.type==='ice') {
+        if (!remoteSet()) pendingRemoteICE.push(m.candidate);
+        else { try { await pc.addIceCandidate(m.candidate); } catch(e){ log('addIceCandidate (sender) error:', e); } }
+      }
+    };
+  </script>
+</body>

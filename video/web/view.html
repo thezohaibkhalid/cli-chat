@@ -1,0 +1,106 @@
+<!doctype html><meta charset="utf-8">
+<title>View Camera</title>
+<body>
+  <h3>Viewing camera</h3>
+  <!-- muted helps autoplay across browsers -->
+  <video id="remote" autoplay playsinline muted controls
+         style="width:640px;max-width:100%;display:block;background:#000"></video>
+  <button id="playBtn" style="margin:8px 0;display:none">▶️ Play</button>
+  <pre id="log" style="max-width:640px;white-space:pre-wrap"></pre>
+
+  <script>
+    const remote = document.getElementById('remote');
+    const playBtn = document.getElementById('playBtn');
+    const logEl = document.getElementById('log');
+    const log = (...a)=>{ console.log(...a); logEl.textContent += a.join(' ') + "\n"; };
+
+    const sid = new URLSearchParams(location.search).get('sid');
+    if (!sid) { document.body.append("Missing sid"); throw new Error("sid required"); }
+
+    const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+    function wsSend(o){const d=JSON.stringify(o);
+      if(ws.readyState===WebSocket.OPEN) ws.send(d);
+      else if(ws.readyState===WebSocket.CONNECTING) ws.addEventListener('open',()=>ws.send(d),{once:true});
+      else log('WS not open; drop',o.type);
+    }
+    ws.addEventListener('open',()=>{ log('WS open, sending hello (viewer)'); ws.send(JSON.stringify({role:'viewer', sid})); });
+
+    const pc = new RTCPeerConnection({ iceServers:[{urls:'stun:stun.l.google.com:19302'}] });
+
+    // Ensure a receiving transceiver (helps some browsers)
+    const rx = pc.addTransceiver('video', { direction: 'recvonly' });
+
+    // Prefer H264 if available
+    (function preferH264(){
+      try {
+        const caps = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
+        if (!caps || !caps.codecs) return;
+        const h264 = caps.codecs.filter(c=>/H264/i.test(c.mimeType));
+        const others = caps.codecs.filter(c=>!/H264/i.test(c.mimeType));
+        const prefs = h264.concat(others);
+        if (rx && rx.setCodecPreferences) rx.setCodecPreferences(prefs);
+        log('Codec pref set (viewer): H264 preferred');
+      } catch(e){ log('Codec pref error (viewer):', e); }
+    })();
+
+    pc.onicegatheringstatechange = ()=>log('iceGatheringState:', pc.iceGatheringState);
+    pc.onconnectionstatechange   = ()=>log('connectionState:', pc.connectionState);
+    pc.onsignalingstatechange    = ()=>log('signalingState:', pc.signalingState);
+
+    // Playback helpers
+    function ensurePlay() {
+      remote.play().then(()=>{ log('remote.play() OK'); playBtn.style.display='none'; })
+                   .catch(err=>{ log('remote.play() blocked:', err); playBtn.style.display='inline-block'; });
+    }
+    remote.addEventListener('loadedmetadata', ()=>{ log('loadedmetadata size=', remote.videoWidth+'x'+remote.videoHeight); ensurePlay(); });
+    remote.addEventListener('canplay', ensurePlay);
+    remote.addEventListener('resize', ()=>{ log('resize size=', remote.videoWidth+'x'+remote.videoHeight); });
+    playBtn.addEventListener('click', ensurePlay);
+
+    // Attach incoming video robustly
+    pc.ontrack = e => {
+      log('ontrack fired, streams=', e.streams.length);
+      if (e.streams && e.streams[0]) {
+        remote.srcObject = e.streams[0];
+        log('attached e.streams[0]');
+      } else {
+        const ms = new MediaStream([e.track]);
+        remote.srcObject = ms;
+        log('attached MediaStream(track)');
+      }
+      ensurePlay();
+      // If supported, log frame arrivals
+      if ('requestVideoFrameCallback' in remote) {
+        const raf = remote.requestVideoFrameCallback.bind(remote);
+        const loop = ()=>raf((now,meta)=>{ log('frame', meta.width+'x'+meta.height, 'rt='+meta.mediaTime.toFixed(2)); loop(); });
+        loop();
+      }
+    };
+
+    // ICE buffering until remote offer set
+    const pendingRemoteICE = [];
+    const remoteSet = ()=> pc.remoteDescription && pc.remoteDescription.type;
+    async function drainICE(){
+      while (pendingRemoteICE.length) {
+        const c = pendingRemoteICE.shift();
+        try { await pc.addIceCandidate(c); } catch(e){ log('addIceCandidate (viewer) error:', e); }
+      }
+    }
+
+    ws.onmessage = async ev=>{
+      const m = JSON.parse(ev.data);
+      if (m.type==='offer') {
+        log('Received offer');
+        await pc.setRemoteDescription({type:'offer', sdp:m.sdp});
+        await drainICE();
+        const ans = await pc.createAnswer();
+        await pc.setLocalDescription(ans);
+        log('Sending answer');
+        wsSend({type:'answer', sdp: pc.localDescription.sdp});
+      } else if (m.type==='ice') {
+        if (!remoteSet()) pendingRemoteICE.push(m.candidate);
+        else { try { await pc.addIceCandidate(m.candidate); } catch(e){ log('addIceCandidate (viewer) error:', e); } }
+      }
+    };
+  </script>
+</body>

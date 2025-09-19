@@ -323,8 +323,9 @@ func (s *chatServer) handleVideoAccept(callee string) {
 	base := os.Getenv("VIDEO_BASE_URL")
 	if base == "" { base = "http://127.0.0.1:5001" }
 
-	senderURL := fmt.Sprintf("%s/v/send?sid=%s", base, sid) // Bilal opens this to SEND camera
-	viewerURL := fmt.Sprintf("%s/v/view?sid=%s", base, sid) // Zohaib opens this to VIEW
+	senderURL := fmt.Sprintf("%s/v/send.html?sid=%s", base, sid)
+    viewerURL := fmt.Sprintf("%s/v/view.html?sid=%s", base, sid)
+
 
 	// In this design, the callee shares camera (as you requested). If you want requester to share instead, swap roles below.
 
@@ -352,6 +353,23 @@ func generateSID() string {
 	rand.Seed(time.Now().UnixNano())
 	for i := range b { b[i] = letters[rand.Intn(len(letters))] }
 	return string(b)
+}
+
+func (s *chatServer) systemBroadcast(exclude, msg string) {
+	s.mu.Lock()
+	receivers := make([]*userConn, 0, len(s.clients))
+	for u, c := range s.clients {
+		if u == exclude || c == nil {
+			continue
+		}
+		receivers = append(receivers, c)
+	}
+	s.mu.Unlock()
+
+	for _, uc := range receivers {
+		writeLine(uc.w, yellow, msg)
+		writePrompt(uc.w, uc.name)
+	}
 }
 
 // ===== Helpers =====
